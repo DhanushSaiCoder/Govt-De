@@ -105,11 +105,11 @@ async function fetchViaWorkerAndExtract(targetUrl) {
       const html = data.html || '';
       const trimmed = html.replace(/\s+/g, ' ').trim();
       const isAppShell = /<app-root[^>]*>(\s*)<\/app-root>/i.test(html)
-                     || /<div id="root"[^>]*>(\s*)<\/div>/i.test(html)
-                     || /<router-outlet[^>]*>/i.test(html)
-                     || (trimmed.length < 900 && /<script|<app-root|<router-outlet|window\.app/i.test(html));
+        || /<div id="root"[^>]*>(\s*)<\/div>/i.test(html)
+        || /<router-outlet[^>]*>/i.test(html)
+        || (trimmed.length < 900 && /<script|<app-root|<router-outlet|window\.app/i.test(html));
       if (isAppShell) {
-        return { error: 'spa_shell', message: 'Dynamic SPA detected — page loads content via JavaScript. Use the paste-HTML fallback or upload PDF.', final_url: data.final_url, html_snippet: html.slice(0,400) };
+        return { error: 'spa_shell', message: 'Dynamic SPA detected — page loads content via JavaScript. Use the paste-HTML fallback or upload PDF.', final_url: data.final_url, html_snippet: html.slice(0, 400) };
       }
     }
 
@@ -243,7 +243,7 @@ function showPasteFallback(originalUrl) {
     const res = await extractFromHTML(html, originalUrl || null);
     renderResult(res, originalUrl);
   });
-  document.getElementById('pasteCancel').addEventListener('click', ()=> {
+  document.getElementById('pasteCancel').addEventListener('click', () => {
     document.querySelector('.output').innerHTML = '<div class="muted">Summary will appear here…</div>';
   });
 }
@@ -252,8 +252,31 @@ function showPasteFallback(originalUrl) {
    small helpers (same as your code)
    =========================== */
 /* Candidate collection, scoring, detection helpers (copied) */
+/* ---------- Improved collector + smarter scoring (drop-in replacement) ---------- */
+
+const CLASS_HINTS = [
+  'eligib', 'eligibility', 'who-can', 'who_can', 'whois', 'applicants', 'benefit', 'beneficiaries',
+  'document', 'documents', 'requirement', 'requirements', 'proof', 'howto', 'how-to', 'apply', 'application',
+  'criteria', 'criteria-list', 'steps', 'procedure', 'instructions', 'notice', 'announcement', 'scheme', 'policy'
+];
+
 function collectCandidateBlocks(doc, bodyText = '') {
   const blocks = [];
+  const seen = new Set();
+
+  // helper to push block if node not seen and content length > 0
+  function pushBlock(node, heading = '') {
+    if (!node) return;
+    if (seen.has(node)) return;
+    seen.add(node);
+    const text = (node.innerText || '').trim();
+    if (!text) return;
+    // limit block length to reasonable amount
+    const content = text.length > 10000 ? text.slice(0, 10000) : text;
+    blocks.push({ heading: (heading || '').trim(), content, node });
+  }
+
+  // 1) headings + following siblings (existing logic)
   const headings = Array.from(doc.querySelectorAll('h1,h2,h3,h4'));
   headings.forEach(h => {
     const headingText = (h.innerText || '').trim();
@@ -265,17 +288,110 @@ function collectCandidateBlocks(doc, bodyText = '') {
       n = n.nextElementSibling;
       cap++;
     }
-    blocks.push({ heading: headingText, content: buf.trim(), node: h });
+    // use node = h (so link extraction still works)
+    if (buf.trim()) pushBlock(h, headingText);
   });
+
+  // 2) lists and tables (existing)
   Array.from(doc.querySelectorAll('ul,ol,table')).forEach(el => {
-    const text = el.innerText || '';
-    blocks.push({ heading: findNearestHeading(el) || '', content: text.trim(), node: el });
+    if (el && el.innerText && el.innerText.trim()) pushBlock(el, findNearestHeading(el) || '');
   });
+
+  // 3) semantic containers
+  Array.from(doc.querySelectorAll('section,article,main,aside,[role="region"],[role="main"]')).forEach(el => {
+    if (el && el.innerText && el.innerText.trim()) pushBlock(el, findNearestHeading(el) || '');
+  });
+
+  // 4) elements with class/ID/aria hints
+  // search for elements whose className or id or aria-label contains hint keywords
+  const all = Array.from(doc.querySelectorAll('div,section,article'));
+  for (let el of all) {
+    if (!el || seen.has(el)) continue;
+    const meta = ((el.className || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('role') || '')).toLowerCase();
+    if (!meta) continue;
+    for (let hint of CLASS_HINTS) {
+      if (meta.includes(hint)) {
+        // ignore tiny nodes
+        if ((el.innerText || '').trim().length < 30) break;
+        pushBlock(el, findNearestHeading(el) || '');
+        break;
+      }
+    }
+  }
+
+  // 5) text-density fallback for other divs (catch "div soup" content)
+  // We'll pick divs with decent text length and relatively few child elements
+  for (let el of Array.from(doc.querySelectorAll('div'))) {
+    if (!el || seen.has(el)) continue;
+    const text = (el.innerText || '').trim();
+    if (!text || text.length < 120) continue; // minimum size
+    const childCount = (el.querySelectorAll('*') || []).length;
+    const density = computeTextDensity(text, childCount); // words per child factor
+    // heuristic: if density is high (>= 8) OR text very large (>800) include it
+    if (density >= 8 || text.length > 800) {
+      pushBlock(el, findNearestHeading(el) || '');
+    }
+  }
+
+  // 6) fallback: Readability/body paragraphs (only if no blocks found)
   if (!blocks.length && bodyText) {
     const paras = bodyText.split(/\n{1,3}/).map(s => s.trim()).filter(Boolean);
-    for (let i = 0; i < Math.min(8, paras.length); i++) blocks.push({ heading: '', content: paras[i], node: null });
+    for (let i = 0; i < Math.min(8, paras.length); i++) {
+      blocks.push({ heading: '', content: paras[i], node: null });
+    }
   }
+
   return blocks;
+}
+
+// compute text density: roughly words per child element (plus smoothing)
+function computeTextDensity(text, childCount) {
+  const words = (text.split(/\s+/).length) || 1;
+  return words / Math.max(1, (childCount || 0) + 1);
+}
+
+/* ---------- Smarter scoring: give boosts when classes/roles/hints present ---------- */
+function scoreBlock(heading = '', content = '', node = null) {
+  let score = 0;
+  const h = (heading || '').toLowerCase();
+  const c = (content || '').toLowerCase();
+
+  // heading weight (same)
+  if (matchKeywords(h, ELIG_KEYWORDS)) score += 0.36;
+
+  // structural weight: lists, bullets, table rows
+  if (/^\s*(•|-|\u2022|\d+\.)/.test(content) || content.split('\n').length > 3) score += 0.28;
+
+  // keyword density as before
+  const kd = keywordDensity(c, ELIG_KEYWORDS);
+  score += Math.min(0.26, kd * 3);
+
+  // class/id/aria hint boost
+  try {
+    if (node && node.getAttribute) {
+      const meta = ((node.className || '') + ' ' + (node.id || '') + ' ' + (node.getAttribute('aria-label') || '')).toLowerCase();
+      if (meta) {
+        for (let hint of CLASS_HINTS) {
+          if (meta.includes(hint)) {
+            score += 0.25; // strong boost for explicit class hint
+            break;
+          }
+        }
+      }
+      // role hint (region/main) small boost
+      const role = node.getAttribute('role') || '';
+      if (role && /region|main|content|article/.test(role.toLowerCase())) score += 0.12;
+    }
+  } catch (e) {
+    // ignore node access errors
+  }
+
+  // text-density boost: denser blocks more likely to be meaningful
+  const words = Math.max(1, content.split(/\s+/).length);
+  if (words > 200) score += 0.08;
+  if (words > 600) score += 0.06;
+
+  return Math.max(0, Math.min(1, score));
 }
 
 function findNearestHeading(el) {
