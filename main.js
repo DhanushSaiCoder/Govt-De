@@ -1,18 +1,18 @@
-/* =========================
-   Minimal integrated client code
-   - extractFromHTML (heuristics + Readability)
-   - fetchViaWorkerAndExtract (calls worker)
-   - renderResult (UI)
-   Adjust WORKER_URL below.
-   ========================= */
+/* main.js - drop-in replacement
+   - WORKER_URL set to your worker
+   - SPA detection + paste fallback
+   - extractor + worker integration + renderer
+*/
 
-const WORKER_URL = 'https://yourworker.workers.dev'; // <-- CHANGE THIS to your worker
+const WORKER_URL = 'https://govscheme-proxy.dhanushsai-work.workers.dev'; // <- YOUR WORKER
 
-/* ----- Utility lists ----- */
+/* ----- Keyword lists ----- */
 const ELIG_KEYWORDS = ['eligible', 'eligibility', 'who can apply', 'who is eligible', 'applicants', 'beneficiary', 'beneficiaries', 'target group'];
 const DOC_KEYWORDS = ['document', 'documents', 'proof', 'id proof', 'identity proof', 'address proof', 'income certificate', 'photo', 'aadhar', 'passport', 'voter id'];
 
-/* ---------- Main extractor (simplified but fully usable) ---------- */
+/* ===========================
+   extractFromHTML (same as before)
+   =========================== */
 async function extractFromHTML(htmlString, sourceUrl = null) {
   try {
     htmlString = sanitizeHtmlString(htmlString);
@@ -82,7 +82,9 @@ async function extractFromHTML(htmlString, sourceUrl = null) {
   }
 }
 
-/* ---------- Worker fetch + driver ---------- */
+/* ===========================
+   fetchViaWorkerAndExtract (with SPA detection)
+   =========================== */
 async function fetchViaWorkerAndExtract(targetUrl) {
   try {
     if (!WORKER_URL || WORKER_URL.includes('yourworker')) {
@@ -98,17 +100,28 @@ async function fetchViaWorkerAndExtract(targetUrl) {
     const data = await r.json();
     if (data.error) return { error: 'worker_error', details: data };
 
+    // SPA detection heuristic
+    if (data.content_type && data.content_type.includes('text/html')) {
+      const html = data.html || '';
+      const trimmed = html.replace(/\s+/g, ' ').trim();
+      const isAppShell = /<app-root[^>]*>(\s*)<\/app-root>/i.test(html)
+                     || /<div id="root"[^>]*>(\s*)<\/div>/i.test(html)
+                     || /<router-outlet[^>]*>/i.test(html)
+                     || (trimmed.length < 900 && /<script|<app-root|<router-outlet|window\.app/i.test(html));
+      if (isAppShell) {
+        return { error: 'spa_shell', message: 'Dynamic SPA detected — page loads content via JavaScript. Use the paste-HTML fallback or upload PDF.', final_url: data.final_url, html_snippet: html.slice(0,400) };
+      }
+    }
+
     if (data.content_type && data.content_type.includes('application/pdf')) {
-      // Worker returned base64 PDF. We don't handle PDF extraction here unless pdf.js is loaded.
       if (typeof window.pdfjsLib === 'undefined') {
         return { error: 'pdf_requires_pdfjs', message: 'PDF returned. Include pdf.js to process or ask user to download and paste text.', final_url: data.final_url };
       }
-      // If pdf.js exists, convert and extract text (not implemented here by default).
+      // PDF path with pdf.js omitted for zero-budget default
     }
 
     const htmlString = data.html || '';
     const out = await extractFromHTML(htmlString, data.final_url || targetUrl);
-    // redact PII again for safety
     if (!out.error) {
       out.eligibility = out.eligibility.map(redactPII);
       out.documents = out.documents.map(redactPII);
@@ -120,7 +133,9 @@ async function fetchViaWorkerAndExtract(targetUrl) {
   }
 }
 
-/* ---------- Render result to UI ---------- */
+/* ===========================
+   UI render + paste fallback
+   =========================== */
 function renderResult(result, targetUrl) {
   const container = document.querySelector('.output');
   container.innerHTML = '';
@@ -130,6 +145,11 @@ function renderResult(result, targetUrl) {
     return;
   }
   if (result.error) {
+    // If SPA, show a short card and caller will show paste fallback
+    if (result.error === 'spa_shell') {
+      container.innerHTML = `<div class="result-card"><h2>Dynamic site detected</h2><div class="muted" style="margin-top:6px">${escapeHTML(result.message)}</div><div class="muted" style="margin-top:8px">Try: Copy page HTML or article text and paste below.</div></div>`;
+      return;
+    }
     container.innerHTML = `<div class="result-card"><strong>Error:</strong> ${escapeHTML(result.error)}<div class="muted" style="margin-top:8px;">${escapeHTML(result.message || JSON.stringify(result.details || ''))}</div></div>`;
     return;
   }
@@ -137,7 +157,7 @@ function renderResult(result, targetUrl) {
   const card = document.createElement('div');
   card.className = 'result-card';
 
-  // Title + confidence badge
+  // Title + badge
   const h = document.createElement('h2');
   h.style.margin = '0 0 6px 0';
   h.textContent = result.title || 'Untitled page';
@@ -187,24 +207,51 @@ function renderResult(result, targetUrl) {
     links.style.marginTop = '8px';
     links.innerHTML = `<h3 style="margin:0 0 6px 0">Where to apply</h3>`;
     result.apply_links.forEach(l => {
-      const a = document.createElement('a');
-      a.href = l; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      const a = document.createElement('a'); a.href = l; a.target = '_blank'; a.rel = 'noopener noreferrer';
       a.textContent = l.length > 40 ? l.slice(0, 40) + '…' : l;
       links.appendChild(a);
     });
     card.appendChild(links);
   }
 
-  // Raw snippet toggle
+  // Raw snippet
   const rawBox = document.createElement('details');
   rawBox.style.marginTop = '10px';
   rawBox.innerHTML = `<summary style="cursor:pointer">View raw text snippet</summary><pre style="white-space:pre-wrap;margin-top:8px;background:#f8fafc;padding:10px;border-radius:6px;">${escapeHTML(result.raw_text_snippet || '')}</pre>`;
   card.appendChild(rawBox);
 
-  container.appendChild(card);
+  document.querySelector('.output').appendChild(card);
 }
 
-/* ---------- Helpers (smaller versions of the full ones) ---------- */
+/* Paste fallback UI (shown when SPA detected) */
+function showPasteFallback(originalUrl) {
+  const container = document.querySelector('.output');
+  container.innerHTML = `
+    <div class="result-card">
+      <h2>Paste page HTML / text</h2>
+      <div class="muted">This site requires JavaScript to render. Copy the page's HTML (View → Save Page As → Webpage, HTML only) or copy the article text and paste here.</div>
+      <textarea id="pasteArea" style="width:100%;height:180px;margin-top:12px;padding:10px;border-radius:8px;border:1px solid var(--border)"></textarea>
+      <div style="margin-top:10px">
+        <button id="pasteRun" class="btn">Run Extractor on pasted text</button>
+        <button id="pasteCancel" class="btn" style="background:#eee;color:#111;margin-left:8px">Cancel</button>
+      </div>
+    </div>
+  `;
+  document.getElementById('pasteRun').addEventListener('click', async () => {
+    const html = document.getElementById('pasteArea').value.trim();
+    if (!html) return alert('Paste HTML or text first.');
+    const res = await extractFromHTML(html, originalUrl || null);
+    renderResult(res, originalUrl);
+  });
+  document.getElementById('pasteCancel').addEventListener('click', ()=> {
+    document.querySelector('.output').innerHTML = '<div class="muted">Summary will appear here…</div>';
+  });
+}
+
+/* ===========================
+   small helpers (same as your code)
+   =========================== */
+/* Candidate collection, scoring, detection helpers (copied) */
 function collectCandidateBlocks(doc, bodyText = '') {
   const blocks = [];
   const headings = Array.from(doc.querySelectorAll('h1,h2,h3,h4'));
@@ -279,6 +326,7 @@ function computeConfidence(eligList, docList, topBlocks) {
   return conf;
 }
 
+/* Schema validation, redact, sanitize, escape helpers (copied) */
 function validateOutputSchema(obj) {
   const errors = [];
   if (!('title' in obj)) errors.push('missing title');
@@ -319,7 +367,7 @@ function escapeHTML(s) {
   return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-/* ---------- Wire UI actions ---------- */
+/* Wire UI: submit handler shows fallback when SPA */
 document.addEventListener('DOMContentLoaded', () => {
   const form = document.querySelector('form');
   const input = document.getElementById('schemeUrl');
@@ -334,14 +382,18 @@ document.addEventListener('DOMContentLoaded', () => {
     btn.disabled = true;
     try {
       const res = await fetchViaWorkerAndExtract(url);
+      // SPA fallback
+      if (res && res.error === 'spa_shell') {
+        renderResult(res, url);
+        showPasteFallback(res.final_url || url);
+        btn.disabled = false;
+        return;
+      }
       renderResult(res, url);
-      // If returned invalid schema or pdf warning, show guidance
       if (res && res.error === 'pdf_requires_pdfjs') {
         out.insertAdjacentHTML('beforeend', '<div class="muted" style="margin-top:8px;">PDF detected — include pdf.js in the page to extract PDFs, or ask user to upload the PDF file.</div>');
       }
-      if (res && res.error && res.details) {
-        console.error('Details:', res.details);
-      }
+      if (res && res.error && res.details) console.error('Details:', res.details);
     } catch (err) {
       out.innerHTML = '<div class="result-card"><strong>Error:</strong> ' + escapeHTML(String(err)) + '</div>';
     } finally {
